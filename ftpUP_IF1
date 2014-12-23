@@ -1,0 +1,516 @@
+#!/bin/bash -x
+. /etc/profile
+. ~/.bash_profile
+#################################################################
+# 作者： 李翔
+# 时间： 20141219
+# 用途： 通用FTP文本上传脚本, 可用于任何项目中
+# 版本： 1.0.1.0
+################################################################
+
+
+
+# 当前天日期
+curDay=`date '+%Y%m%d'`
+# 程序运行日志目录
+LOGPATH=log
+# 配置文件名
+CfgFile=ftpserver.cfg
+# 工作目录
+WORKPATH=`pwd`
+# 日志文件名前缀
+LOGNAME=""
+# 进程名称
+PROCNAME=""
+# 进程Id 
+PROCID=0
+
+#数据文件对应发送目录，当开启此功能时
+declare -A dst_dir
+dst_dir=([MLTE_UuLog]="guangzhou/cdr/uu" 
+         [MLTE_X2Log]="guangzhou/cdr/x2" 
+         [MLTE_UE_MRLog]="guangzhou/cdr/ue_mr" 
+         [MLTE_CELL_MRLog]="guangzhou/cdr/cell_mr" 
+         [MLTE_S1_MMELog]="guangzhou/cdr/s1_mme" 
+         [MLTE_S6aLog]="guangzhou/cdr/s6a" 
+         [MLTE_S10S11Log]="guangzhou/cdr/s10s11" 
+         [MLTE_S5S8CLog]="guangzhou/cdr/s5s8c" 
+         [MLTE_SGsLog]="guangzhou/cdr/sgs" 
+         [MLTE_GncLog]="guangzhou/cdr/gnc" 
+         [MLTE_XDR_SIGNALLOG]="guangzhou/cdr/xdr_signal" 
+         [MLTE_XDR_BUSILOG]="guangzhou/cdr/xdr_busi" 
+         [MLTE_XDR_UEMRLOG]="guangzhou/cdr/xdr_uemr" 
+         [MLTE_S1ULog]="guangzhou/cdr/s1u" 
+         [MLTE_S1U_HTTPLog]="guangzhou/cdr/s1u_http" 
+         [MLTE_S1U_DNSLog]="guangzhou/cdr/s1u_dns" 
+         [MLTE_S1U_MMSLog]="guangzhou/cdr/s1u_mms" 
+         [MLTE_S1U_FTPLog]="guangzhou/cdr/s1u_ftp" 
+         [MLTE_S1U_EMAILLog]="guangzhou/cdr/s1u_email"
+		     [MLTE_S1U_VOIPLog]="guangzhou/cdr/si1_voip"
+		     [MLTE_S1U_RTSPLog]="guangzhou/cdr/s1u_rtsp"
+		     [MLTE_S1U_IMLog]="guangzhou/cdr/s1u_im"
+		     [MLTE_S1U_P2PLog]="guangzhou/cdr/s1u_p2p" )
+
+function LOGGER()
+{
+    echo `date '+%D %T'` $* >> $LOGPATH'/'$LOGNAME'_'$curDay.log
+}
+
+function LogMgr()
+{
+    local tmpDay=`date '+%Y%m%d'`
+    if [ $tmpDay = $curDay ] ; then
+        return 
+    fi
+    # 切换日志文件
+    curDay=$tmpDay
+    # 保留近6天的日志
+    find $LOGPATH -mtime +6 -name "$LOGNAME_*.log" -delete
+}
+
+function DeleteFile()
+{
+    # 目录 文件数
+    local _deletePath=$1
+    local _deleteCnt=$2
+    local Cnt=0
+    # 获取删除目录的数据文件名 删除时间较老的数据
+    for deleteFile in ` ls -rt $_deletePath | grep -E $MATCHFILE | head $_deleteCnt `  #有问题head必须是-n选项
+    do
+        rm -rf $_deletePath/$deleteFile
+        let Cnt=$Cnt+1
+        LOGGER "delete file $$_deletePath/$deleteFile "
+    done
+    return $Cnt
+}
+
+# 文件列表初始化
+function FileListInit()
+{
+    # 刷新文件上传列表
+    if [ -z $SEGSENDFILETYPE ]
+    then
+		FileList=(`ls -t $DATAPATH | grep -E $MATCHFILE`)
+    else
+        FileList=(`ls -t $DATAPATH | grep -E \"$MATCHFILE\|$SEGSENDFILETYPE\"`)
+    fi
+    
+    
+    if [ 0 -ne ${#FileList[*]} ]#个数
+    then
+        LOGGER "upCnt=["${#FileList[*]}"] ["${FileList[*]}"]"#全部内容
+    fi
+}
+
+function DiskMgr()
+{
+    local _UsefullSize=$(df -k $DATAPATH | awk '{ if(1!=FNR) print $4/1024/1024 }')#有问题？会打印出几行 这是一个bug路径过长会出现
+    # 如果磁盘空间 没有达到门限值不处理
+    if [ $USEFULLSIZE -le ${_UsefullSize%%.*} ] ; then
+        return 
+    fi
+    local _deleteCnt=$DELETECNT
+    # 如果备份文件存在 则先删除备份文件
+    if [ ! -z $DATBAKPATH ] ; then
+        DeleteFile $DATBAKPATH $deleteCnt             #参数传递有问题
+        let deleteCnt=$deleteCnt-$?
+    fi
+    # 如果已经删除了最大
+    if [ 0 -eq $_deleteCnt ] ; then 
+        return 
+    fi
+    # 后删除正常未上传的数据文件
+    DeleteFile $DATBAKPATH $deleteCnt
+    FileListInit
+}
+
+#配置文件解析
+function LoadCfg()
+{
+    for cfg in `grep = $CfgFile`
+    do
+        # 将配置文件中的配置行注释部分去掉
+        param=${cfg%%#*}
+        paramName=${cfg%%=*}
+        paramValue=${cfg##*=}
+        if [ -z $paramName ] ; then
+            continue
+        elif [ -z $paramValue ]; then
+            continue
+        fi
+        eval $paramName=$paramValue
+    done
+}
+
+# 检查变量是否存在  如果不存在说明配置缺失
+function chechVar()
+{
+    __localCheck__=$(eval echo \$$1)
+    if [ -z $__localCheck__ ]
+    then
+        LOGGER file $CfgFile don\'t configure $1 or $1=\'\'
+        exit 1
+    else
+        LOGGER $1=$__localCheck__
+    fi
+}
+
+# 检查变量是否存在  如果不存在动态生成变量并设置缺省值
+function chechVarD()
+{
+    __localCheck__=$(eval echo \$$1)
+    if [ -z $__localCheck__ ]
+    then
+        #LOGGER file $CfgFile don\'t configure $1 or $1=\'\'
+        eval $1=$2
+    else
+        LOGGER $1=$__localCheck__
+    fi
+}
+
+# 检查配置是否完整
+function chechCfg()
+{
+    chechVar DATAPATH
+    chechVar MATCHFILE
+    chechVar USERNAME
+    chechVar PASSWORD
+    chechVar FTPPATH
+    chechVar FTPHOST
+    chechVarD PARALLEL 2
+    chechVarD DATBAKPATH ""
+    chechVarD USEFULLSIZE 10
+    chechVarD DELETECNT 5
+    chechVarD COMPRESSION "no"
+    # 去掉目录后面加的/符号
+    DATAPATH=${DATAPATH%/}
+    FTPPATH=${FTPPATH%/}
+    DATBAKPATH=${DATBAKPATH%/}
+    # 将大小转换成 KB
+    # let USEFULLSIZE=$USEFULLSIZE*1048576
+}
+
+# 检查目录是否存在不存在则创建
+function CheckDir()
+{
+    if [ ! -d $1 ] ; then
+        mkdir -p $1
+    fi
+}
+
+# 防止系统重启导致数据没有完整上传
+# 将没有上传完成的数据文件放回源数据目录
+function Restart()
+{
+    CheckDir $DATAPATH
+    UPPATH=`echo $DATAPATH/FtpUp`
+    CheckDir $UPPATH
+    for upFile in `ls $UPPATH/ | grep -E $UPSUFFIX`
+    do
+        datFile=${upFile/%$UPSUFFIX/$MATCHFILE}
+        mv $UPPATH/$upFile $DATAPATH/$datFile
+        #删除上次传输时的日志文件
+        if [ -f $UPPATH/$datFile.log ] ; then
+            rm $UPPATH/$datFile.log
+        fi
+    done
+}
+
+function Init()
+{
+    # 生成日志名前缀
+    PROCNAME=$0
+    PROCNAME=${PROCNAME##*/}
+    LOGNAME=${PROCNAME%%.*}
+    # CfgFile=`echo $LOGNAME.cfg`
+    # 检查日志目录是否存在 不存在创建
+    CheckDir $LOGPATH
+    unset FileList
+    # 检查配置文件是否存在
+    if [ ! -f $CfgFile ] ; then
+        echo 'DATAPATH=    # 数据存放路径'  >>$CfgFile
+        echo 'MATCHFILE=   # 匹配文件待上传的后缀' >>$CfgFile
+        echo 'DATBAKPATH=  # 数据备份目录' >>$CfgFile
+        echo 'USERNAME=    # ftp服务器用户名'  >>$CfgFile
+        echo 'PASSWORD=    # ftp密码'  >>$CfgFile
+        echo 'FTPPATH=     # ftp上传路径'   >>$CfgFile
+        echo 'FTPHOST=     # ftp服务器IP地址'   >>$CfgFile
+        echo 'PARALLEL=    # ftp上传并行数 缺省为2个'   >>$CfgFile
+        echo 'USEFULLSIZE= # 磁盘可用大小小于nG时 开始删除没有被上传调的文件 缺省为5G'   >>$CfgFile
+        echo 'DELETECNT=   # 磁盘空间满时则删除文件的个数缺省5个 先删除备份目录再删除未上传文件'   >>$CfgFile
+        echo please configure $CfgFile
+        exit 0
+    fi
+}
+
+function FileBak()
+{
+    local upFile=$1
+    local dataName=$2
+    if [ -z $DATBAKPATH ] ; then 
+        if [ -e $UPPATH/$upFile ] ; then
+            rm $UPPATH/$upFile
+        fi
+        return 
+    else
+        mv $UPPATH/$upFile $DATBAKPATH/$dataName
+        LOGGER data [$dataName] move to [$DATBAKPATH]
+    fi
+}
+
+function GetSerFile()
+{
+    local dataName=$1
+	local NOWFTPPATH=$FTPPATH
+	if [ "$ISFILETODIFFERENTPOSITION"x == "yes"x ]       
+	then
+		# 如果配置了开启不同文件特定目录传输,则需要改变检查传输路径
+		local interface_name=`echo $dataName| awk -F'_DBMsg' '{print $1}'`
+		NOWFTPPATH=${dst_dir[$interface_name]}
+	fi
+	
+    ftp -n $FTPHOST <<EOF
+    user $USERNAME $PASSWORD
+    cd $NOWFTPPATH
+    ls $dataName
+    by
+EOF
+}
+
+#使用lftp传输测试
+lftp2put()
+{
+   lftp -u ${USERNAME},${PASSWORD} ftp://${FTPHOST} <<EOF #2>$WORKPATH/errfile_mul
+   set net:timeout 30;set net:max-retries 3;set net:reconnect-interval-base 5;set net:reconnect-interval-multiplier 1
+   cd $1
+   put $2
+   bye
+EOF
+}
+
+# 上传ftp文件
+function DoUp()
+{
+    LOGGER data [$dataName] uping....
+    local _BeginTime=`date +%s`
+    local upFile=$1
+    local dataName=$2
+    
+    local _upFileSize=`ls -l $UPPATH/$upFile | awk '{print $5/1024} '`
+    local isExist=` (GetSerFile $dataName)|awk -v dName=$dataName -v dNo=' No '  'BEGIN{dCnt=0}{if(index($0,dName)&&0==index($0,dNo)){dCnt=dCnt+1}}END{print dCnt }' `
+    if [ 0 -ne $isExist ] ; then
+        local tmpName=`date +"%H%M%S"`
+        local _FtpInfo=` (GetSerFile $dataName) | awk -v dName=$dataName '{if(index($0,dName))print $5,$6,$7,$8} ' `
+        local _LocalInfo=`ls -l $UPPATH/$upFile | awk '{print $5,$6,$7,$8} '`
+        # 如果文件已经上传 则不再传输
+        LOGGER FtpInfo[$_FtpInfo] LocalInfo[$_LocalInfo] data [$dataName] move to [$dataName]
+        # 此种情况属于异常 备份时将文件名加上日期.后期可以核对数据
+        FileBak $upFile $dataName
+        return 
+    fi
+
+    cd $UPPATH
+    # 开始上传文件
+	local FTPPATHCHANGE=$FTPPATH
+	if [ "$ISFILETODIFFERENTPOSITION"x == "yes"x ]       
+	then
+		# 如果配置了开启不同文件特定目录传输,则需要改变传输路径
+		local interface_name=`echo $name| awk -F'_DBMsg' '{print $1}'`
+		FTPPATHCHANGE=${dst_dir[$interface_name]}
+	fi	
+
+    ftp -in $FTPHOST <<EOF 
+    user $USERNAME $PASSWORD
+    prompt
+    cd $FTPPATHCHANGE
+    binary
+    put $upFile
+    rename $upFile $dataName
+    by
+EOF
+
+    cd $WORKPATH
+    local _EndTime=`date +%s`
+    local _durTime
+    let _durTime=$_EndTime-$_BeginTime
+	
+    # 检查文件是否上传成功 
+    isExist=` (GetSerFile $dataName)|awk -v dName=$dataName 'BEGIN{dCnt=0}{if(index($0,dName)){dCnt=dCnt+1}}END{print dCnt }' `
+    if [ 0 -eq $isExist ] ; then
+        # 如果文件没有上传成功 将数据移入数据目录 后续再做重传
+        mv $UPPATH/$upFile  $DATAPATH/$dataName
+        if [ "$COMPRESSION"x == "gzip"x ]        #这里判断有问题，已纠正
+        then
+            # 如果配置了压缩,则需要解压缩
+            gunzip $dataName
+        fi
+        LOGGER "data [$dataName] up failed, later will retransmission. "
+        return
+    else
+		LOGGER data [$dataName] up success,Occupancy time[${_durTime}s] size[${_upFileSize%%.*}KB]!
+    fi
+	#检测是否有成功标志
+	if [ "$FILETOSUCCTRANS"x = ".sgn"x ]
+	then
+	local SendSuccFlag=`echo ${dataName%.gz*}'.sgn'`
+	lftp2put $FTPPATHCHANGE ${UPPATH}/$SendSuccFlag
+	#传送完后删除标志
+	rm -rf ${UPPATH}/$SendSuccFlag
+	fi
+	#备份
+    FileBak $upFile $dataName
+}
+
+# 检查目录是否存在不存在则创建
+function UpFile()
+{
+    # 检查文件列表是否有值
+    if [ 0 -eq ${#FileList[*]} ]
+    then
+        FileListInit
+    fi
+    # FileList 的文件顺序为${FileList[0]} 最新 ${FileList[n]} 最老
+    # 循环拉起ftp上传
+    while [ 0 -ne ${#FileList[*]} ]
+    do
+        # 获取正在上传的文件数
+        local upCnt=`ls $UPPATH | awk -v upsuffix=$UPSUFFIX 'BEGIN{upCnt=0}{if(index($1,upsuffix)){upCnt=upCnt+1}}END{print upCnt}' `
+        # 如果正在上传的文件数大于等于并发数则不做上创
+        if [ $PARALLEL -lt $upCnt ] ; then
+            return
+        fi
+        let "fileIndex=${#FileList[*]}-1"
+        # ftp上传时将最老的文件先传
+        local dataName=${FileList[fileIndex]}
+		#如果配置了成功指示标志FILETOSUCCTRANS
+		if [ $FILETOSUCCTRANS = ".sgn" ]
+		then
+			touch ${UPPATH}/$dataName.sng
+			echo $DATAPATH/$dataName >> ${UPPATH}/$dataName.sng
+			echo `ls -l $DATAPATH/$dataName |awk '{print $5}'` >> ${UPPATH}/$dataName.sng
+			echo `cat $DATAPATH/$dataName |wc -l` >> ${UPPATH}/$dataName.sng
+			echo `md5sum $DATAPATH/$dataName|cut -d ' ' -f1` >> ${UPPATH}/$dataName.sng
+		fi
+        if [ $COMPRESSION = "gzip" ]
+        then
+            # 如果配置了压缩,则先压缩数据
+            gzip -S ".gz" $dataName
+            dataName=`echo ${dataName}'.gz'`
+        fi
+        local upName=${dataName/%$MATCHFILE/$UPSUFFIX}
+        mv $DATAPATH/$dataName $UPPATH/$upName
+        (DoUp $upName $dataName) >>$LOGPATH'/'$LOGNAME'_'$curDay.log &
+        unset FileList[fileIndex]
+        sleep 1
+    done
+}
+
+# 获取在云心的进程ID列表
+function GetPidList()
+{
+    local _pidCnt
+    PROCID=`cat .$LOGNAME.pid`
+    if [ ${#PROCID} -eq 0 ]
+    then
+        PROCID=0
+    else
+        # 防止错误匹配进程ID
+        _pidCnt=`ps -eo pid | awk -v procid=$PROCID ' BEGIN{pCnt=0}{if($1==procid){pCnt=pCnt+1}}END{print pCnt} '`
+        if [ $_pidCnt -eq 0 ] ; then
+            PROCID=0
+        fi
+    fi
+}
+
+# 杀死进程
+function KillPid()
+{
+    # 进程没有启动
+    if [ ${PROCID} -eq 0 ] ; then
+        return 
+    fi
+    LOGGER "kill process [$PROCID]...... "
+    # 杀死进程及子进程
+    local _pid
+    for _pid in `ps -eo pid,ppid,cmd | awk -v procid=$PROCID '{if(($1==procid)||($2==procid)){print $1}}' `
+    do 
+        kill $_pid
+    done
+    PROCID=0
+}
+
+# 记录当前进程ID
+function WritePid()
+{
+    # 记录当前进程ID
+    local _pid
+    local _pPath
+    for _pid in `ps -eo pid,ppid,cmd | awk -v procid=$$ -v procn=$LOGNAME '{if(($2==procid)&&index($0,procn)){print $1}}' `
+    do 
+        echo $_pid >.$LOGNAME.pid
+        #if [ $_pid -ne $$ ] ; then
+        #    # 防止同一台主机上不同目录启动
+        #    _pPath=`lsof -p $_pid  | awk ' { if($4=="cwd") print $9 } ' `
+        #    if [ $_pPath = $WORKPATH ] ; then 
+        #        echo $_pid >.$LOGNAME.pid
+        #        return 
+        #    fi
+        #fi
+    done
+}
+
+# 业务进程
+function Run()
+{
+    WritePid
+    while true
+    do
+       # 上传文件
+       UpFile
+       # 日志文件处理
+       LogMgr
+       # 磁盘管理
+       DiskMgr
+       # 1分钟扫描1次目录并处理日志文件
+       sleep 60
+    done 
+}
+
+# 处理主函数
+function main()
+{
+    # 系统初始化
+    Init
+    GetPidList
+    case "$1" in 
+    "stop" | "kill" )
+    KillPid
+    exit 0
+    ;;
+    "start" | "" )
+    ;;
+    "restart")
+    KillPid
+    ;;
+    * )
+    exit 0
+    ;;
+    esac
+    if [ ${PROCID} -ne 0 ]
+    then
+        LOGGER "[$0] is runing... pid[$PROCID]"
+        return 
+    fi
+    # 加在配置
+    LoadCfg
+    # 检查配置是否完整
+    chechCfg
+    # 防止系统重启导致数据没有完整上传
+    Restart
+    # 开始处理业务
+    ( Run ) >>/dev/null &
+    sleep 2
+}
+# 主函数入口
+main $*
+
